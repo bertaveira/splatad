@@ -15,7 +15,6 @@ from gsplat._helper import load_test_data
 device = torch.device("cuda:0")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
 @pytest.fixture
 def test_data():
     (
@@ -241,9 +240,7 @@ def test_compute_lidar_velocity(test_data):
     torch.testing.assert_close(v_velocities, _v_velocities, rtol=1e-5, atol=1e-3)
 
 
-pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
-
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
 def test_compute_pix_velocity(test_data):
     from gsplat.cuda._torch_impl import _compute_pix_velocity
     from gsplat.cuda._wrapper import compute_pix_velocity, quat_scale_to_covar_preci, world_to_cam
@@ -924,9 +921,9 @@ def test_rasterize_to_pixels(test_data, channels: int):
     radii, means2d, depths, conics, _, pix_vels = fully_fused_projection(
         means,
         covars,
+        None,
+        None,
         velocities,
-        None,
-        None,
         viewmats,
         Ks,
         width,

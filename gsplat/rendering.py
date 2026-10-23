@@ -33,7 +33,7 @@ def rasterization(
     linear_velocity: Optional[Tensor] = None,  # [C, 3]
     angular_velocity: Optional[Tensor] = None,  # [C, 3]
     rolling_shutter_time: Optional[Tensor] = None,  # [C]
-    rolling_shutter_direction: Optional[int] = 1,  # 1: top2bottom, 2: bottom2top, 3: left2right, 4: right2left, 5: no rolling shutter
+    rolling_shutter_direction: Optional[int] = 1,  # 1: top2bottom, 2: left2right, 3: bottom2top, 4: right2left, 5: no rolling shutter
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     radius_clip: float = 0.0,

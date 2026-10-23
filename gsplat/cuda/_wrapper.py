@@ -820,7 +820,7 @@ def rasterize_to_pixels(
     isect_offsets: Tensor,                         # [C, tile_height, tile_width]
     flatten_ids: Tensor,                           # [n_isects]
     rolling_shutter_time: Optional[Tensor] = None, # [C]
-    rolling_shutter_direction: Optional[int] = None, # 1: top2bottom, 2: bottom2top, 3: left2right, 4: right2left, 5: no rolling shutter
+    rolling_shutter_direction: Optional[int] = None, # 1: top2bottom, 2: left2right, 3: bottom2top, 4: right2left, 5: no rolling shutter
     backgrounds: Optional[Tensor] = None,          # [C, channels]
     packed: bool = False,
     absgrad: bool = False,
@@ -1921,7 +1921,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         if absgrad:
             means2d.absgrad = v_means2d_abs
 
-        if ctx.needs_input_grad[6]:
+        if ctx.needs_input_grad[7]:
             v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
                 dim=(1, 2)
             )

@@ -1262,7 +1262,7 @@ __global__ void fully_fused_projection_packed_fwd_kernel(
 
     // check if the points are in the image region
     // float radius;
-    glm::vec2 pix_vel;
+    glm::vec2 pix_vel = { 0.f, 0.f };
     float extent_x;
     float extent_y;
     if (valid) {

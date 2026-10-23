@@ -1622,7 +1622,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rasterize
                                          means2d.options().dtype(torch::kFloat32));
     torch::Tensor alphas = torch::empty({C, image_height, image_width, 1},
                                         means2d.options().dtype(torch::kFloat32));
-    torch::Tensor render_medians = torch::empty({C, image_height, image_width, channels},
+    torch::Tensor render_medians = torch::zeros({C, image_height, image_width, channels},
                                          means2d.options().dtype(torch::kFloat32));
     torch::Tensor last_ids = torch::empty({C, image_height, image_width},
                                           means2d.options().dtype(torch::kInt32));
