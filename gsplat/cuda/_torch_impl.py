@@ -607,6 +607,46 @@ def _isect_offset_encode(isect_ids: Tensor, C: int, tile_width: int, tile_height
     return offsets.int()
 
 
+def render_weight_from_alpha(
+    alphas: Tensor,  # [M]
+    ray_indices: Tensor,  # [M] sorted, one contiguous segment per ray
+) -> Tuple[Tensor, Tensor]:
+    """Front-to-back compositing weights, in pure PyTorch.
+
+    Drop-in for ``nerfacc.render_weight_from_alpha`` for the sorted, segment-contiguous
+    ``ray_indices`` that ``rasterize_to_indices_in_range`` produces. The exclusive
+    product of ``(1 - alpha)`` along each segment is evaluated as an exclusive cumulative
+    sum of logs in float64, so long segments keep their precision.
+    """
+    if alphas.numel() == 0:
+        return alphas, torch.ones_like(alphas)
+    log_one_minus = torch.log(torch.clamp_min(1.0 - alphas, 1e-12)).double()
+    exclusive = torch.cumsum(log_one_minus, 0) - log_one_minus
+    starts = torch.ones_like(ray_indices, dtype=torch.bool)
+    starts[1:] = ray_indices[1:] != ray_indices[:-1]
+    segment_ids = torch.cumsum(starts.long(), 0) - 1
+    base = exclusive[starts][segment_ids]
+    trans = torch.exp(exclusive - base).to(alphas.dtype)
+    return alphas * trans, trans
+
+
+def accumulate_along_rays(
+    weights: Tensor,  # [M]
+    values: Optional[Tensor],  # [M, D] or None
+    ray_indices: Tensor,  # [M]
+    n_rays: int,
+) -> Tensor:
+    """Weighted per-ray sum, in pure PyTorch (drop-in for ``nerfacc.accumulate_along_rays``)."""
+    if values is None:
+        contributions = weights[:, None]
+    else:
+        contributions = weights[:, None] * values
+    out = torch.zeros(
+        (n_rays, contributions.shape[-1]), dtype=contributions.dtype, device=weights.device
+    )
+    return out.index_add(0, ray_indices, contributions)
+
+
 def accumulate(
     means2d: Tensor,  # [C, N, 2]
     conics: Tensor,  # [C, N, 3]
@@ -635,11 +675,6 @@ def accumulate(
         But it could serve as a playground for new ideas or debugging, as no backward
         implementation is needed.
 
-    .. warning::
-
-        This function requires the `nerfacc` package to be installed. Please install it
-        using the following command `pip install nerfacc`.
-
     Args:
         means2d: Gaussian means in 2D. [C, N, 2]
         conics: Inverse of the 2D Gaussian covariance, Only upper triangle values. [C, N, 3]
@@ -658,11 +693,6 @@ def accumulate(
         - **renders**: Accumulated colors. [C, image_height, image_width, channels]
         - **alphas**: Accumulated opacities. [C, image_height, image_width, 1]
     """
-
-    try:
-        from nerfacc import accumulate_along_rays, render_weight_from_alpha
-    except ImportError:
-        raise ImportError("Please install nerfacc package: pip install nerfacc")
 
     C, N = means2d.shape[:2]
     channels = colors.shape[-1]
@@ -685,7 +715,7 @@ def accumulate(
     indices = camera_ids * image_height * image_width + pixel_ids
     total_pixels = C * image_height * image_width
 
-    weights, trans = render_weight_from_alpha(alphas, ray_indices=indices, n_rays=total_pixels)
+    weights, trans = render_weight_from_alpha(alphas, ray_indices=indices)
     renders = accumulate_along_rays(
         weights,
         colors[camera_ids, gaussian_ids],
@@ -730,11 +760,6 @@ def accumulate_lidar(
         But it could serve as a playground for new ideas or debugging, as no backward
         implementation is needed.
 
-    .. warning::
-
-        This function requires the `nerfacc` package to be installed. Please install it
-        using the following command `pip install nerfacc`.
-
     Args:
         means2d: Gaussian means in 2D. [C, N, 2]
         conics: Inverse of the 2D Gaussian covariance, Only upper triangle values. [C, N, 3]
@@ -753,11 +778,6 @@ def accumulate_lidar(
         - **renders**: Accumulated colors. [C, image_height, image_width, channels]
         - **alphas**: Accumulated opacities. [C, image_height, image_width, 1]
     """
-
-    try:
-        from nerfacc import accumulate_along_rays, render_weight_from_alpha
-    except ImportError:
-        raise ImportError("Please install nerfacc package: pip install nerfacc")
 
     C, N = means2d.shape[:2]
     channels = lidar_features.shape[-1]
@@ -806,7 +826,7 @@ def accumulate_lidar(
             alphas_until_points, None, ray_indices=indices, n_rays=total_pixels
         ).reshape(C, image_height, image_width, 1)
 
-    weights, trans = render_weight_from_alpha(alphas, ray_indices=indices, n_rays=total_pixels)
+    weights, trans = render_weight_from_alpha(alphas, ray_indices=indices)
     renders = accumulate_along_rays(
         weights,
         render_features,
@@ -853,10 +873,6 @@ def _rasterize_to_pixels(
         But it could serve as a playground for new ideas or debugging, as no backward
         implementation is needed.
 
-    .. warning::
-
-        This function requires the `nerfacc` package to be installed. Please install it
-        using the following command `pip install nerfacc`.
     """
     from ._wrapper import rasterize_to_indices_in_range
 
@@ -953,10 +969,6 @@ def _rasterize_to_points(
         But it could serve as a playground for new ideas or debugging, as no backward
         implementation is needed.
 
-    .. warning::
-
-        This function requires the `nerfacc` package to be installed. Please install it
-        using the following command `pip install nerfacc`.
     """
     from ._wrapper import rasterize_to_indices_in_range_lidar
 
