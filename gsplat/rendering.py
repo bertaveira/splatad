@@ -267,6 +267,7 @@ def rasterization(
         radius_clip=radius_clip,
         sparse_grad=sparse_grad,
         calc_compensations=(rasterize_mode == "antialiased"),
+        opacities=opacities,
     )
 
     if packed:
@@ -685,6 +686,7 @@ def lidar_rasterization(
         radius_clip=radius_clip,
         sparse_grad=sparse_grad,
         calc_compensations=(rasterize_mode == "antialiased"),
+        opacities=opacities,
     )
 
     if packed:

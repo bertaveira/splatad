@@ -1014,6 +1014,136 @@ def test_rasterize_to_pixels(test_data, channels: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.parametrize("calc_compensations", [False, True])
+def test_opacity_tight_bounds_are_lossless(test_data, calc_compensations: bool):
+    """Opacity-aware tile extents must shrink the intersection list without
+    changing a single rendered pixel: everything they cull is below the
+    rasterizer's alpha threshold anyway."""
+    from gsplat.cuda._wrapper import (
+        fully_fused_lidar_projection,
+        fully_fused_projection,
+        isect_offset_encode,
+        isect_tiles,
+        rasterize_to_pixels,
+    )
+
+    Ks = test_data["Ks"]
+    viewmats = test_data["viewmats"]
+    height = test_data["height"]
+    width = test_data["width"]
+    quats = test_data["quats"]
+    scales = test_data["scales"] * 0.1
+    means = test_data["means"]
+    velocities = test_data["velocities"].detach()
+    linear_velocity = test_data["linear_velocity"]
+    angular_velocity = test_data["angular_velocity"]
+    rolling_shutter_time = test_data["rolling_shutter_time"]
+    C = len(Ks)
+    N = len(means)
+    # Spread opacities over the full range so the opacity bound actually bites.
+    opacities = torch.rand(N, device=device) ** 3
+    colors = torch.randn(C, N, 3, device=device)
+
+    def project(opacity_bound):
+        return fully_fused_projection(
+            means,
+            None,
+            quats,
+            scales,
+            velocities,
+            viewmats,
+            Ks,
+            width,
+            height,
+            linear_velocity,
+            angular_velocity,
+            rolling_shutter_time,
+            calc_compensations=calc_compensations,
+            opacities=opacity_bound,
+        )
+
+    # Unit opacities give the plain 3-sigma footprint with the bounded path's
+    # rounding, i.e. an exact superset of every pixel the rasterizer can draw.
+    loose = project(torch.ones_like(opacities))
+    tight = project(opacities)
+    legacy = project(None)
+    radii_loose, radii_tight = loose[0], tight[0]
+    valid_loose = (radii_loose > 0).all(dim=-1)
+    valid_tight = (radii_tight > 0).all(dim=-1)
+    assert valid_tight.sum() < valid_loose.sum()
+    assert bool((valid_tight <= valid_loose).all())
+    assert bool((radii_tight[valid_tight] <= radii_loose[valid_tight]).all())
+    both = valid_tight & valid_loose
+    for a, b in zip(loose[1:], tight[1:]):
+        if a is None:
+            continue
+        torch.testing.assert_close(a[both], b[both])
+
+    tile_size = 16
+    tile_width = math.ceil(width / float(tile_size))
+    tile_height = math.ceil(height / float(tile_size))
+
+    def render(radii, means2d, depths, conics, compensations, pix_vels):
+        tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+            means2d, radii, depths, tile_size, tile_width, tile_height
+        )
+        isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+        opac = opacities.repeat(C, 1)
+        if compensations is not None:
+            opac = opac * compensations
+        rendered, alphas, _ = rasterize_to_pixels(
+            means2d,
+            conics,
+            colors,
+            opac,
+            pix_vels,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            rolling_shutter_time=rolling_shutter_time,
+        )
+        return rendered, alphas, int(tiles_per_gauss.sum())
+
+    render_loose, alphas_loose, n_loose = render(*loose)
+    render_tight, alphas_tight, n_tight = render(*tight)
+    render_legacy, _, n_legacy = render(*legacy)
+    assert n_tight < n_loose
+    torch.testing.assert_close(render_tight, render_loose, rtol=0, atol=1e-6)
+    torch.testing.assert_close(alphas_tight, alphas_loose, rtol=0, atol=1e-6)
+    # The legacy path truncates its extents, which drops sub-pixel Gaussians
+    # and boundary pixels whose alpha is barely above the threshold; the
+    # bounded path keeps them, so it is close to but not identical with it.
+    assert n_tight < n_legacy
+    assert float((render_tight - render_legacy).abs().mean()) < 1e-3
+
+    # The lidar projection applies the same bound (in degrees).
+    def project_lidar(opacity_bound):
+        return fully_fused_lidar_projection(
+            means,
+            None,
+            quats,
+            scales,
+            velocities,
+            viewmats,
+            linear_velocity,
+            angular_velocity,
+            rolling_shutter_time,
+            calc_compensations=calc_compensations,
+            opacities=opacity_bound,
+        )
+
+    radii_loose = project_lidar(None)[0]
+    radii_tight = project_lidar(opacities)[0]
+    valid_loose = (radii_loose > 0).all(dim=-1)
+    valid_tight = (radii_tight > 0).all(dim=-1)
+    assert valid_tight.sum() < valid_loose.sum()
+    assert bool((valid_tight <= valid_loose).all())
+    assert bool((radii_tight[valid_tight] <= radii_loose[valid_tight] + 1e-6).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
 @pytest.mark.parametrize("compute_alpha_sum_until_points", [False, True])
 @pytest.mark.parametrize("use_depth_compensations", [False, True])
 def test_rasterize_to_points(test_data, compute_alpha_sum_until_points: bool, use_depth_compensations: bool):

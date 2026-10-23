@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 
 #define RAD_TO_DEG 57.2957795131f
+// Rasterizers skip contributions with alpha below this; projection uses it to
+// bound tile extents by opacity (https://arxiv.org/pdf/2402.00525 Sec. B.2).
+#define ALPHA_THRESHOLD (1.f / 255.f)
 
 inline __device__ void depth_compensation_from_cov3d(const glm::mat3 cov3d, const float eps2d, glm::vec2 &depth_compensation) {
     // cov3d is a 3x3 matrix [a1, a2, a3; b1, b2, b3; c1, c2, c3]

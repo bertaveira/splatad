@@ -247,12 +247,17 @@ def fully_fused_projection(
     packed: bool = False,
     sparse_grad: bool = False,
     calc_compensations: bool = False,
+    opacities: Optional[Tensor] = None,  # [N]
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Projects Gaussians to 2D.
 
     This function fuse the process of computing covariances
     (:func:`quat_scale_to_covar_preci()`), transforming to camera space (:func:`world_to_cam()`),
     and perspective projection (:func:`persp_proj()`).
+
+    If `opacities` is given, the tile extents are tightened to the radius beyond which
+    the Gaussian's alpha falls under the rasterizer's threshold (1/255), which culls
+    nothing the rasterizer would have drawn. It is not a gradient input.
 
     .. note::
 
@@ -339,6 +344,9 @@ def fully_fused_projection(
     if velocities is not None:
         assert velocities.size() == (N, 3), velocities.size()
         velocities = velocities.contiguous()
+    if opacities is not None:
+        assert opacities.size() == (N,), opacities.size()
+        opacities = opacities.detach().contiguous()
     if sparse_grad:
         assert packed, "sparse_grad is only supported when packed is True"
 
@@ -364,6 +372,7 @@ def fully_fused_projection(
             radius_clip,
             sparse_grad,
             calc_compensations,
+            opacities,
         )
     else:
         return _FullyFusedProjection.apply(
@@ -384,6 +393,7 @@ def fully_fused_projection(
             far_plane,
             radius_clip,
             calc_compensations,
+            opacities,
         )
 
 
@@ -408,12 +418,15 @@ def fully_fused_lidar_projection(
     packed: bool = False,
     sparse_grad: bool = False,
     calc_compensations: bool = False,
+    opacities: Optional[Tensor] = None,  # [N]
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Projects Gaussians to 2D.
 
     This function fuse the process of computing covariances
     (:func:`quat_scale_to_covar_preci()`), transforming to lidar space (:func:`world_to_cam()`),
     and spherical projection (:func:`lidar_proj()`).
+
+    `opacities` optionally tightens the tile extents as in :func:`fully_fused_projection`.
 
     .. note::
 
@@ -527,6 +540,7 @@ def fully_fused_lidar_projection(
             far_plane,
             radius_clip,
             calc_compensations,
+            opacities,
         )
 
 @torch.no_grad()
@@ -1524,6 +1538,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         far_plane: float,
         radius_clip: float,
         calc_compensations: bool,
+        opacities: Optional[Tensor],  # [N] or None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         # "covars" and {"quats", "scales"} are mutually exclusive
         radii, means2d, depths, conics, compensations, pix_vels = _make_lazy_cuda_func(
@@ -1546,6 +1561,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             far_plane,
             radius_clip,
             calc_compensations,
+            opacities,
         )
         if not calc_compensations:
             compensations = None
@@ -1646,6 +1662,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
     
 class _FullyFusedLidarProjection(torch.autograd.Function):
@@ -1672,6 +1689,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
         far_plane: float,
         radius_clip: float,
         calc_compensations: bool,
+        opacities: Optional[Tensor],  # [N] or None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         # "covars" and {"quats", "scales"} are mutually exclusive
         radii, means2d, depths, conics, compensations, pix_vels, depth_compensation = _make_lazy_cuda_func(
@@ -1695,6 +1713,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             far_plane,
             radius_clip,
             calc_compensations,
+            opacities,
         )
         if not calc_compensations:
             compensations = None
@@ -1788,6 +1807,7 @@ class _FullyFusedLidarProjection(torch.autograd.Function):
             v_scales,
             None,
             v_viewmats,
+            None,
             None,
             None,
             None,
@@ -2146,6 +2166,7 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
         radius_clip: float,
         sparse_grad: bool,
         calc_compensations: bool,
+        opacities: Optional[Tensor],  # [N] or None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         (
             indptr,
@@ -2175,6 +2196,7 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
             far_plane,
             radius_clip,
             calc_compensations,
+            opacities,
         )
         if not calc_compensations:
             compensations = None
@@ -2322,6 +2344,7 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
             v_scales,
             None,
             v_viewmats,
+            None,
             None,
             None,
             None,

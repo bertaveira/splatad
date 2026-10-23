@@ -620,6 +620,8 @@ fully_fused_projection_fwd_kernel(const uint32_t C, const uint32_t N,
                                   const float near_plane,
                                   const float far_plane,
                                   const float radius_clip,
+                                  const float *__restrict__ opacities,            // [N] optional
+                                  const bool calc_compensations,
                                   // outputs
                                   int32_t *__restrict__ radii,                    // [C, N, 2]
                                   float *__restrict__ means2d,                    // [C, N, 2]
@@ -699,8 +701,21 @@ fully_fused_projection_fwd_kernel(const uint32_t C, const uint32_t N,
     // float v2 = b - sqrt(max(0.1f, b * b - det));
     // float radius = ceil(3.f * sqrt(max(v1, v2)));
 
-    float extent_x = 3.f * sqrt(covar2d[0][0]);
-    float extent_y = 3.f * sqrt(covar2d[1][1]);
+    // Opacity-aware bound: beyond it the rasterizer would skip the Gaussian anyway.
+    float extend = 3.f;
+    if (opacities != nullptr) {
+        float opacity = opacities[gid];
+        if (calc_compensations) {
+            opacity *= compensation;
+        }
+        if (opacity < ALPHA_THRESHOLD) {
+            radii[idx * 2] = 0;
+            return;
+        }
+        extend = min(extend, sqrtf(2.f * __logf(opacity / ALPHA_THRESHOLD)));
+    }
+    float extent_x = extend * sqrt(covar2d[0][0]);
+    float extent_y = extend * sqrt(covar2d[1][1]);
 
     if (extent_x <= radius_clip && extent_y <= radius_clip) {
         radii[idx * 2] = 0;
@@ -722,8 +737,14 @@ fully_fused_projection_fwd_kernel(const uint32_t C, const uint32_t N,
         //radius += hypotf(pix_vel.x, pix_vel.y) * 0.5f * rs_time;
     }
 
+    if (opacities != nullptr) {
+        // The opacity bound is exact, so round the tile extent up rather than
+        // truncating it; the legacy path keeps its truncation for parity.
+        extent_x = ceilf(extent_x);
+        extent_y = ceilf(extent_y);
+    }
+
     // mask out gaussians outside the image region
-    
     if (mean2d.x + extent_x <= 0 || mean2d.x - extent_x >= image_width ||
         mean2d.y + extent_y <= 0 || mean2d.y - extent_y >= image_height) {
         radii[idx * 2] = 0;
@@ -981,7 +1002,8 @@ fully_fused_projection_fwd_tensor(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const bool calc_compensations) {
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
     if (covars.has_value()) {
@@ -993,6 +1015,9 @@ fully_fused_projection_fwd_tensor(
     }
     if (velocities.has_value()) {
         CHECK_INPUT(velocities.value());
+    }
+    if (opacities.has_value()) {
+        CHECK_INPUT(opacities.value());
     }
     CHECK_INPUT(viewmats);
     CHECK_INPUT(Ks);
@@ -1032,7 +1057,9 @@ fully_fused_projection_fwd_tensor(
             eps2d,
             near_plane,
             far_plane,
-            radius_clip, 
+            radius_clip,
+            opacities.has_value() ? opacities.value().data_ptr<float>() : nullptr,
+            calc_compensations,
             radii.data_ptr<int32_t>(),
             means2d.data_ptr<float>(),
             depths.data_ptr<float>(),
@@ -1169,6 +1196,8 @@ __global__ void fully_fused_projection_packed_fwd_kernel(
     const float *__restrict__ rolling_shutter_time, // [C]
     const float eps2d,
     const float near_plane, const float far_plane, const float radius_clip,
+    const float *__restrict__ opacities, // [N] optional
+    const bool calc_compensations,
     const int32_t *__restrict__ block_accum, // [C * blocks_per_row] packing helper
     int32_t *__restrict__ block_cnts,        // [C * blocks_per_row] packing helper
     // outputs
@@ -1271,8 +1300,21 @@ __global__ void fully_fused_projection_packed_fwd_kernel(
         // float v1 = b + sqrt(max(0.1f, b * b - det));
         // float v2 = b - sqrt(max(0.1f, b * b - det));
         // radius = ceil(3.f * sqrt(max(v1, v2)));
-        extent_x = 3.f * sqrt(covar2d[0][0]);
-        extent_y = 3.f * sqrt(covar2d[1][1]);
+        // Opacity-aware bound: beyond it the rasterizer would skip the Gaussian anyway.
+        float extend = 3.f;
+        if (opacities != nullptr) {
+            float opacity = opacities[col_idx];
+            if (calc_compensations) {
+                opacity *= compensation;
+            }
+            if (opacity < ALPHA_THRESHOLD) {
+                valid = false;
+            } else {
+                extend = min(extend, sqrtf(2.f * __logf(opacity / ALPHA_THRESHOLD)));
+            }
+        }
+        extent_x = extend * sqrt(covar2d[0][0]);
+        extent_y = extend * sqrt(covar2d[1][1]);
 
         if (extent_x <= radius_clip && extent_y <= radius_clip) {
             valid = false;
@@ -1288,6 +1330,12 @@ __global__ void fully_fused_projection_packed_fwd_kernel(
                                         glm::make_vec3(angular_velocity), vel_c, Ks[0], Ks[4], Ks[2], Ks[5], image_width, image_height, pix_vel);
             extent_x += fabs(pix_vel.x) * 0.5f * rolling_shutter_time[0];
             extent_y += fabs(pix_vel.y) * 0.5f * rolling_shutter_time[0];
+        }
+
+        if (opacities != nullptr) {
+            // Exact opacity bound: round up instead of truncating (see above).
+            extent_x = ceilf(extent_x);
+            extent_y = ceilf(extent_y);
         }
 
         // mask out gaussians outside the image region
@@ -1368,7 +1416,8 @@ fully_fused_projection_packed_fwd_tensor(
     const torch::Tensor &rolling_shutter_time,  // [C]
     const float eps2d,
     const float near_plane, const float far_plane, const float radius_clip,
-    const bool calc_compensations) {
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
     if (covars.has_value()) {
@@ -1381,6 +1430,9 @@ fully_fused_projection_packed_fwd_tensor(
     if (velocities.has_value()) {
         CHECK_INPUT(velocities.value());
     }
+    if (opacities.has_value()) {
+        CHECK_INPUT(opacities.value());
+    }
     CHECK_INPUT(viewmats);
     CHECK_INPUT(Ks);
     CHECK_INPUT(linear_velocity);
@@ -1391,6 +1443,8 @@ fully_fused_projection_packed_fwd_tensor(
     uint32_t C = viewmats.size(0); // number of cameras
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     auto opt = means.options().dtype(torch::kInt32);
+    const float *opacities_ptr =
+        opacities.has_value() ? opacities.value().data_ptr<float>() : nullptr;
 
     uint32_t nrows = C;
     uint32_t ncols = N;
@@ -1414,7 +1468,7 @@ fully_fused_projection_packed_fwd_tensor(
             viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height,
             linear_velocity.data_ptr<float>(), angular_velocity.data_ptr<float>(),
             rolling_shutter_time.data_ptr<float>(),
-            eps2d, near_plane, far_plane, radius_clip, nullptr,
+            eps2d, near_plane, far_plane, radius_clip, opacities_ptr, calc_compensations, nullptr,
             block_cnts.data_ptr<int32_t>(), nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr);
         block_accum = torch::cumsum(block_cnts, 0, torch::kInt32);
@@ -1448,7 +1502,8 @@ fully_fused_projection_packed_fwd_tensor(
             viewmats.data_ptr<float>(), Ks.data_ptr<float>(), image_width, image_height,
             linear_velocity.data_ptr<float>(), angular_velocity.data_ptr<float>(),
             rolling_shutter_time.data_ptr<float>(),
-            eps2d, near_plane, far_plane, radius_clip, block_accum.data_ptr<int32_t>(),
+            eps2d, near_plane, far_plane, radius_clip, opacities_ptr, calc_compensations,
+            block_accum.data_ptr<int32_t>(),
             nullptr, indptr.data_ptr<int32_t>(), camera_ids.data_ptr<int64_t>(),
             gaussian_ids.data_ptr<int64_t>(), radii.data_ptr<int32_t>(),
             means2d.data_ptr<float>(), depths.data_ptr<float>(),
@@ -2284,6 +2339,8 @@ fully_fused_lidar_projection_fwd_kernel(const uint32_t C, const uint32_t N,
                                   const float near_plane,
                                   const float far_plane,
                                   const float radius_clip,
+                                  const float *__restrict__ opacities,            // [N] optional
+                                  const bool calc_compensations,
                                   // outputs
                                   float *__restrict__ radii,                      // [C, N]
                                   float *__restrict__ means2d,                    // [C, N, 2]
@@ -2363,8 +2420,21 @@ fully_fused_lidar_projection_fwd_kernel(const uint32_t C, const uint32_t N,
     // float radius = 3.f * sqrt(v1);
     // float v2 = b - sqrt(max(0.1f, b * b - det));
     // float radius = ceil(3.f * sqrt(max(v1, v2)));
-    float extent_azimuth = 3.f * sqrt(max(0.f, covar2d[0][0]));
-    float extent_elevation = 3.f * sqrt(max(0.f, covar2d[1][1]));
+    // Opacity-aware bound: beyond it the rasterizer would skip the Gaussian anyway.
+    float extend = 3.f;
+    if (opacities != nullptr) {
+        float opacity = opacities[gid];
+        if (calc_compensations) {
+            opacity *= compensation;
+        }
+        if (opacity < ALPHA_THRESHOLD) {
+            radii[idx * 2] = 0.f;
+            return;
+        }
+        extend = min(extend, sqrtf(2.f * __logf(opacity / ALPHA_THRESHOLD)));
+    }
+    float extent_azimuth = extend * sqrt(max(0.f, covar2d[0][0]));
+    float extent_elevation = extend * sqrt(max(0.f, covar2d[1][1]));
 
     if (extent_azimuth <= radius_clip && extent_elevation <= radius_clip) {
         radii[idx * 2] = 0.f;
@@ -2647,7 +2717,8 @@ fully_fused_lidar_projection_fwd_tensor(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const bool calc_compensations) {
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
     if (covars.has_value()) {
@@ -2656,6 +2727,9 @@ fully_fused_lidar_projection_fwd_tensor(
         assert(quats.has_value() && scales.has_value());
         CHECK_INPUT(quats.value());
         CHECK_INPUT(scales.value());
+    }
+    if (opacities.has_value()) {
+        CHECK_INPUT(opacities.value());
     }
     if (velocities.has_value()) {
         CHECK_INPUT(velocities.value());
@@ -2700,6 +2774,8 @@ fully_fused_lidar_projection_fwd_tensor(
             near_plane,
             far_plane,
             radius_clip,
+            opacities.has_value() ? opacities.value().data_ptr<float>() : nullptr,
+            calc_compensations,
             radii.data_ptr<float>(),
             means2d.data_ptr<float>(),
             depths.data_ptr<float>(),

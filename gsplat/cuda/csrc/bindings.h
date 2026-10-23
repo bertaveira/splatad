@@ -138,7 +138,8 @@ fully_fused_projection_fwd_tensor(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const bool calc_compensations);
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fully_fused_projection_bwd_tensor(
@@ -187,7 +188,8 @@ fully_fused_lidar_projection_fwd_tensor(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const bool calc_compensations);
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fully_fused_lidar_projection_bwd_tensor(
@@ -442,7 +444,8 @@ fully_fused_projection_packed_fwd_tensor(
     const torch::Tensor &rolling_shutter_time,  // [C]
     const float eps2d,
     const float near_plane, const float far_plane, const float radius_clip,
-    const bool calc_compensations);
+    const bool calc_compensations,
+    const at::optional<torch::Tensor> &opacities);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fully_fused_projection_packed_bwd_tensor(
