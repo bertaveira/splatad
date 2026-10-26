@@ -5,18 +5,38 @@ import torch
 from torch import Tensor
 from typing_extensions import Literal
 
-from gsplat.cuda._wrapper import fully_fused_projection
-
 from .cuda._wrapper import (
+    CameraModel,
+    RollingShutterType,
+    UnscentedTransformParameters,
     fully_fused_lidar_projection,
     fully_fused_projection,
+    fully_fused_projection_with_ut,
     isect_lidar_tiles,
     isect_offset_encode,
     isect_tiles,
     rasterize_to_pixels,
+    rasterize_to_pixels_eval3d,
     rasterize_to_points,
     spherical_harmonics,
+    SUPPORTED_CHANNEL_SIZES,
 )
+
+
+def _eval3d_tile_size(tile_size: int, channels: int, device: torch.device) -> int:
+    """Largest tile size <= ``tile_size`` whose eval3d backward fits in shared memory."""
+    padded = next(c for c in SUPPORTED_CHANNEL_SIZES if c >= channels)
+    props = torch.cuda.get_device_properties(device)
+    limit = getattr(props, "shared_memory_per_block_optin", None) or 48 * 1024
+    # Per thread: int32 id + vec4 (xyz, opacity) + vec3 scale + vec4 quat + CDIM colors.
+    # Must match the shared_mem formula of rasterize_to_pixels_eval3d_bwd_tensor.
+    bytes_per_thread = 4 + 16 + 12 + 16 + 4 * padded
+    while tile_size > 4:
+        needed = tile_size * tile_size * bytes_per_thread
+        if needed <= limit:
+            break
+        tile_size //= 2
+    return tile_size
 
 
 def rasterization(
@@ -47,8 +67,26 @@ def rasterization(
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
+    camera_model: CameraModel = "pinhole",
+    radial_coeffs: Optional[Tensor] = None,  # [C, 4] fisheye k1..k4 (or [C, 6] pinhole)
+    with_ut: bool = False,
+    with_eval3d: bool = False,
+    rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
+    viewmats_rs: Optional[Tensor] = None,  # [C, 4, 4] pose at the end of the exposure
+    ut_params: Optional[UnscentedTransformParameters] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
+
+    .. note::
+        **Fisheye cameras (3DGUT)**: ``with_ut=True`` projects the Gaussians through
+        ``camera_model`` (``"pinhole"``, or OpenCV ``"fisheye"`` with ``radial_coeffs``
+        k1..k4) with the unscented transform, and ``with_eval3d=True`` evaluates them in
+        3D along per-pixel rays. Gradients come from the eval3d rasterizer only, so
+        ``meta["means2d"]`` has no gradient and ``absgrad`` is unavailable. The path
+        requires ``packed=False``, ``sparse_grad=False``, ``rasterize_mode="classic"``
+        and replaces SplatAD's velocity rolling shutter (``linear_velocity``,
+        ``angular_velocity``, ``rolling_shutter_time``, ``velocities``) with the
+        pose-interpolated ``rolling_shutter`` / ``viewmats_rs``.
 
     This function provides a handful features for 3D Gaussian rasterization, which
     we detail in the following notes. A complete profiling of the these features
@@ -231,6 +269,34 @@ def rasterization(
         rolling_shutter_direction = 1
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
 
+    if camera_model != "pinhole" or radial_coeffs is not None or viewmats_rs is not None:
+        assert with_ut, (
+            "camera distortion / fisheye cameras / viewmats_rs are only supported with with_ut=True"
+        )
+    if with_eval3d:
+        assert with_ut, "with_eval3d requires with_ut=True (its tile binning comes from the UT projection)"
+    if rolling_shutter != RollingShutterType.GLOBAL:
+        assert viewmats_rs is not None, "rolling_shutter requires viewmats_rs"
+    if with_ut:
+        assert not packed, "packed mode is not supported with with_ut=True"
+        assert not sparse_grad, "sparse_grad is not supported with with_ut=True"
+        assert rasterize_mode == "classic", (
+            "rasterize_mode='antialiased' is not supported with with_ut=True (eval3d has no 2D blur)"
+        )
+        assert velocities is None, (
+            "per-Gaussian velocities (SplatAD rolling shutter) are not supported with with_ut=True; "
+            "use rolling_shutter / viewmats_rs"
+        )
+        splatad_rs_unused = (
+            bool((linear_velocity == 0).all())
+            and bool((angular_velocity == 0).all())
+            and bool((rolling_shutter_time == 0).all())
+        )
+        assert splatad_rs_unused, (
+            "SplatAD linear_velocity / angular_velocity / rolling_shutter_time are not supported "
+            "with with_ut=True; use rolling_shutter / viewmats_rs"
+        )
+
     if sh_degree is None:
         # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
         assert (colors.dim() == 2 and colors.shape[0] == N) or (
@@ -246,29 +312,65 @@ def rasterization(
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
 
+    if with_eval3d:
+        # The eval3d backward stages one Gaussian per thread in shared memory,
+        # including its colour chunk; large feature counts only fit with smaller tiles.
+        n_channels = 3 if sh_degree is not None else colors.shape[-1]
+        if render_mode in ["RGB+D", "RGB+ED"]:
+            n_channels += 1
+        elif render_mode in ["D", "ED"]:
+            n_channels = 1
+        tile_size = _eval3d_tile_size(tile_size, min(n_channels, channel_chunk), means.device)
+
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
-    proj_results = fully_fused_projection(
-        means,
-        None,  # covars,
-        quats,
-        scales,
-        velocities,
-        viewmats,
-        Ks,
-        width,
-        height,
-        linear_velocity,
-        angular_velocity,
-        rolling_shutter_time,
-        eps2d=eps2d,
-        packed=packed,
-        near_plane=near_plane,
-        far_plane=far_plane,
-        radius_clip=radius_clip,
-        sparse_grad=sparse_grad,
-        calc_compensations=(rasterize_mode == "antialiased"),
-        opacities=opacities,
-    )
+    if with_ut:
+        radii, means2d, depths, conics, compensations = fully_fused_projection_with_ut(
+            means,
+            quats,
+            scales,
+            opacities,  # use opacities to compute a tighter bound for radii.
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d=eps2d,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            radius_clip=radius_clip,
+            calc_compensations=(rasterize_mode == "antialiased"),
+            camera_model=camera_model,
+            ut_params=ut_params,
+            radial_coeffs=radial_coeffs,
+            rolling_shutter=rolling_shutter,
+            viewmats_rs=viewmats_rs,
+        )
+        # No per-Gaussian pixel velocities in this path: the 2D rasterizer sees a
+        # static footprint and the eval3d rasterizer interpolates the pose per pixel.
+        pix_vels = torch.zeros((C, N, 2), device=means.device, dtype=means2d.dtype)
+        proj_results = (radii, means2d, depths, conics, compensations, pix_vels)
+    else:
+        proj_results = fully_fused_projection(
+            means,
+            None,  # covars,
+            quats,
+            scales,
+            velocities,
+            viewmats,
+            Ks,
+            width,
+            height,
+            linear_velocity,
+            angular_velocity,
+            rolling_shutter_time,
+            eps2d=eps2d,
+            packed=packed,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            radius_clip=radius_clip,
+            sparse_grad=sparse_grad,
+            calc_compensations=(rasterize_mode == "antialiased"),
+            opacities=opacities,
+        )
 
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
@@ -329,6 +431,12 @@ def rasterization(
     else:
         # Colors are SH coefficients, with shape [N, K, 3] or [C, N, K, 3]
         camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
+        if viewmats_rs is not None:
+            # view directions from the mid-exposure camera centre
+            camtoworlds = camtoworlds.clone()
+            camtoworlds[:, :3, 3] = 0.5 * (
+                camtoworlds[:, :3, 3] + torch.inverse(viewmats_rs)[:, :3, 3]
+            )
         if packed:
             dirs = means[gaussian_ids, :] - camtoworlds[camera_ids, :3, 3]  # [nnz, 3]
             masks = radii[...,0] > 0  # [nnz]
@@ -365,6 +473,46 @@ def rasterization(
             backgrounds = torch.zeros(C, 1, device=backgrounds.device)
     else:  # RGB
         pass
+    def _rasterize_chunk(colors_chunk, backgrounds_chunk):
+        if with_eval3d:
+            render_colors_, render_alphas_ = rasterize_to_pixels_eval3d(
+                means,
+                quats,
+                scales,
+                colors_chunk,
+                opacities,
+                viewmats,
+                Ks,
+                width,
+                height,
+                tile_size,
+                isect_offsets,
+                flatten_ids,
+                backgrounds=backgrounds_chunk,
+                camera_model=camera_model,
+                radial_coeffs=radial_coeffs,
+                rolling_shutter=rolling_shutter,
+                viewmats_rs=viewmats_rs,
+            )
+            return render_colors_, render_alphas_, None
+        return rasterize_to_pixels(
+            means2d,
+            conics,
+            colors_chunk,
+            opacities,
+            pix_vels,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            rolling_shutter_time,
+            rolling_shutter_direction=rolling_shutter_direction,
+            backgrounds=backgrounds_chunk,
+            packed=packed,
+            absgrad=absgrad,
+        )
+
     if colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
@@ -376,47 +524,19 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_, render_medians_ = rasterize_to_pixels(
-                means2d,
-                conics,
-                colors_chunk,
-                opacities,
-                pix_vels,
-                width,
-                height,
-                tile_size,
-                isect_offsets,
-                flatten_ids,
-                rolling_shutter_time,
-                rolling_shutter_direction=rolling_shutter_direction,
-                backgrounds=backgrounds_chunk,
-                packed=packed,
-                absgrad=absgrad,
+            render_colors_, render_alphas_, render_medians_ = _rasterize_chunk(
+                colors_chunk, backgrounds_chunk
             )
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
             render_medians.append(render_medians_)
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
-        render_medians = torch.cat(render_medians, dim=-1)
-    else:
-        render_colors, render_alphas, render_medians = rasterize_to_pixels(
-            means2d,
-            conics,
-            colors,
-            opacities,
-            pix_vels,
-            width,
-            height,
-            tile_size,
-            isect_offsets,
-            flatten_ids,
-            rolling_shutter_time,
-            rolling_shutter_direction=rolling_shutter_direction,
-            backgrounds=backgrounds,
-            packed=packed,
-            absgrad=absgrad,
+        render_medians = (
+            None if with_eval3d else torch.cat(render_medians, dim=-1)
         )
+    else:
+        render_colors, render_alphas, render_medians = _rasterize_chunk(colors, backgrounds)
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
@@ -447,6 +567,9 @@ def rasterization(
         "tile_size": tile_size,
         "n_cameras": C,
         "render_medians": render_medians,
+        "camera_model": camera_model,
+        "with_ut": with_ut,
+        "with_eval3d": with_eval3d,
     }
     return render_colors, render_alphas, meta
 

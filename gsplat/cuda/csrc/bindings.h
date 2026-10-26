@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include <tuple>
 
+#include "cameras.cuh"
+
 #define N_THREADS 256
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -483,4 +485,83 @@ compute_relocation_tensor(
     torch::Tensor& ratios,
     torch::Tensor& binoms,
     const int n_max
+);
+
+/****************************************************************************
+ * Unscented-transform projection and eval3d rasterization (fisheye / 3DGUT)
+ ****************************************************************************/
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fully_fused_projection_ut_fwd_tensor(
+    const torch::Tensor &means,                   // [N, 3]
+    const torch::Tensor &quats,                   // [N, 4]
+    const torch::Tensor &scales,                  // [N, 3]
+    const at::optional<torch::Tensor> &opacities, // [N] optional
+    const torch::Tensor &viewmats0,               // [C, 4, 4]
+    const at::optional<torch::Tensor> &viewmats1, // [C, 4, 4] optional
+    const torch::Tensor &Ks,                      // [C, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float eps2d,
+    const float near_plane,
+    const float far_plane,
+    const float radius_clip,
+    const bool calc_compensations,
+    const CameraModelType camera_model,
+    const UnscentedTransformParameters ut_params,
+    const ShutterType rs_type,
+    const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
+    const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
+    const at::optional<torch::Tensor> &thin_prism_coeffs  // [C, 4] optional
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval3d_fwd_tensor(
+    const torch::Tensor &means,                     // [N, 3]
+    const torch::Tensor &quats,                     // [N, 4]
+    const torch::Tensor &scales,                    // [N, 3]
+    const torch::Tensor &colors,                    // [C, N, channels]
+    const torch::Tensor &opacities,                 // [C, N]
+    const at::optional<torch::Tensor> &backgrounds, // [C, channels]
+    const at::optional<torch::Tensor> &masks,       // [C, tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const torch::Tensor &viewmats0,               // [C, 4, 4]
+    const at::optional<torch::Tensor> &viewmats1, // [C, 4, 4] optional
+    const torch::Tensor &Ks,                      // [C, 3, 3]
+    const CameraModelType camera_model,
+    const ShutterType rs_type,
+    const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
+    const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
+    const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids   // [n_isects]
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+rasterize_to_pixels_eval3d_bwd_tensor(
+    const torch::Tensor &means,                     // [N, 3]
+    const torch::Tensor &quats,                     // [N, 4]
+    const torch::Tensor &scales,                    // [N, 3]
+    const torch::Tensor &colors,                    // [C, N, channels]
+    const torch::Tensor &opacities,                 // [C, N]
+    const at::optional<torch::Tensor> &backgrounds, // [C, channels]
+    const at::optional<torch::Tensor> &masks,       // [C, tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const torch::Tensor &viewmats0,               // [C, 4, 4]
+    const at::optional<torch::Tensor> &viewmats1, // [C, 4, 4] optional
+    const torch::Tensor &Ks,                      // [C, 3, 3]
+    const CameraModelType camera_model,
+    const ShutterType rs_type,
+    const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
+    const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
+    const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const torch::Tensor &render_alphas,   // [C, image_height, image_width, 1]
+    const torch::Tensor &last_ids,        // [C, image_height, image_width]
+    const torch::Tensor &v_render_colors, // [C, image_height, image_width, channels]
+    const torch::Tensor &v_render_alphas  // [C, image_height, image_width, 1]
 );

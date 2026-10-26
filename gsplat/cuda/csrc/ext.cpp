@@ -51,4 +51,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fully_fused_projection_packed_bwd", &fully_fused_projection_packed_bwd_tensor);
     
     m.def("compute_relocation", &compute_relocation_tensor);
+
+    // unscented-transform projection + eval3d rasterization (fisheye / 3DGUT)
+    py::enum_<CameraModelType>(m, "CameraModelType")
+        .value("PINHOLE", CameraModelType::PINHOLE)
+        .value("FISHEYE", CameraModelType::FISHEYE)
+        .export_values();
+    py::enum_<ShutterType>(m, "ShutterType")
+        .value("ROLLING_TOP_TO_BOTTOM", ShutterType::ROLLING_TOP_TO_BOTTOM)
+        .value("ROLLING_LEFT_TO_RIGHT", ShutterType::ROLLING_LEFT_TO_RIGHT)
+        .value("ROLLING_BOTTOM_TO_TOP", ShutterType::ROLLING_BOTTOM_TO_TOP)
+        .value("ROLLING_RIGHT_TO_LEFT", ShutterType::ROLLING_RIGHT_TO_LEFT)
+        .value("GLOBAL", ShutterType::GLOBAL)
+        .export_values();
+    py::class_<UnscentedTransformParameters>(m, "UnscentedTransformParameters")
+        .def(py::init<>())
+        .def_readwrite("alpha", &UnscentedTransformParameters::alpha)
+        .def_readwrite("beta", &UnscentedTransformParameters::beta)
+        .def_readwrite("kappa", &UnscentedTransformParameters::kappa)
+        .def_readwrite("in_image_margin_factor", &UnscentedTransformParameters::in_image_margin_factor)
+        .def_readwrite("require_all_sigma_points_valid", &UnscentedTransformParameters::require_all_sigma_points_valid);
+
+    m.def("fully_fused_projection_ut_fwd", &fully_fused_projection_ut_fwd_tensor);
+    m.def("rasterize_to_pixels_eval3d_fwd", &rasterize_to_pixels_eval3d_fwd_tensor);
+    m.def("rasterize_to_pixels_eval3d_bwd", &rasterize_to_pixels_eval3d_bwd_tensor);
 }

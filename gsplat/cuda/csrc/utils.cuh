@@ -552,6 +552,73 @@ inline __device__ void add_blur_vjp(const float eps2d, const glm::mat2 conic_blu
         v_sqr_comp * (one_minus_sqr_comp * conic_blur[1][1] - eps2d * det_conic_blur);
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for the eval3d (3DGUT) rasterizer, ported from gsplat v1.5.3
+// Utils.cuh (Apache-2.0).
+// ---------------------------------------------------------------------------
+
+inline __host__ __device__ bool is_near_zero(float x) {
+    return fabsf(x) < 1.1920929e-07f; // float epsilon
+}
+
+inline __device__ void quat_scale_to_preci_half_vjp(
+    // fwd inputs
+    const glm::vec4 quat,
+    const glm::vec3 scale,
+    // precompute
+    const glm::mat3 R,
+    // grad outputs
+    const glm::mat3 v_M, // M is preci_half
+    // grad inputs
+    glm::vec4 &v_quat,
+    glm::vec3 &v_scale
+) {
+    float sx = 1.0f / scale[0], sy = 1.0f / scale[1], sz = 1.0f / scale[2];
+
+    // M = R * S
+    glm::mat3 S = glm::mat3(sx, 0.f, 0.f, 0.f, sy, 0.f, 0.f, 0.f, sz);
+    glm::mat3 v_R = v_M * S;
+
+    // grad for (quat, scale) from preci
+    quat_to_rotmat_vjp(quat, v_R, v_quat);
+
+    v_scale[0] +=
+        -sx * sx *
+        (R[0][0] * v_M[0][0] + R[0][1] * v_M[0][1] + R[0][2] * v_M[0][2]);
+    v_scale[1] +=
+        -sy * sy *
+        (R[1][0] * v_M[1][0] + R[1][1] * v_M[1][1] + R[1][2] * v_M[1][2]);
+    v_scale[2] +=
+        -sz * sz *
+        (R[2][0] * v_M[2][0] + R[2][1] * v_M[2][1] + R[2][2] * v_M[2][2]);
+}
+
+// FMA-stable normalize: explicit round-to-nearest intrinsics pin the
+// instruction sequence so the forward and backward kernels get bit-identical
+// results for identical inputs.
+inline __device__ glm::vec3 safe_normalize(glm::vec3 v) {
+    float l = __fmul_rn(v.x, v.x);
+    l = __fmaf_rn(v.y, v.y, l);
+    l = __fmaf_rn(v.z, v.z, l);
+    if (l > 0.0f) {
+        const float inv = rsqrtf(l);
+        return glm::vec3(__fmul_rn(v.x, inv),
+                         __fmul_rn(v.y, inv),
+                         __fmul_rn(v.z, inv));
+    }
+    return v;
+}
+
+inline __device__ glm::vec3 safe_normalize_bw(const glm::vec3 &v, const glm::vec3 &d_out) {
+    const float l = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (l > 0.0f) {
+        const float il = rsqrtf(l);
+        const float il3 = (il * il * il);
+        return il * d_out - il3 * glm::dot(d_out, v) * v;
+    }
+    return d_out;
+}
+
 inline __device__ float angle_difference(const float angle1, const float angle2) {
     float diff = fmodf((angle1 - angle2 + 180.f), 360.f) - 180.f;
     return diff < -180.f ? diff + 360.f : diff;
