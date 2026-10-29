@@ -341,7 +341,7 @@ def _fully_fused_projection_with_ut(
         valid &= det > 0
         valid &= (cov[:, 0, 0] >= 0) & (cov[:, 1, 1] >= 0)
 
-        extend = torch.full_like(depth, 3.0)
+        extend = torch.full_like(depth, 3.33)
         if opacities is not None:
             op = opacities * comp if calc_compensations else opacities
             valid &= op >= 1.0 / 255.0

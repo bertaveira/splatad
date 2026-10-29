@@ -123,9 +123,11 @@ __global__ void fully_fused_projection_ut_fwd_kernel(
 
     glm::mat2 covar2d_inv = glm::inverse(covar2d);
 
-    // Opacity-aware extent, matching the EWA projection: 3 sigma at most, and
-    // less when the Gaussian's peak alpha is already close to the threshold.
-    float extend = 3.f;
+    // Opacity-aware extent: where the Gaussian's alpha falls below ALPHA_THRESHOLD,
+    // sqrt(2 ln 255) ~ 3.33 sigma for an opaque one. eval3d evaluates the 3D
+    // response wherever a Gaussian is binned, so a tighter cap would make the
+    // image depend on the tile size.
+    float extend = 3.33f;
     if (opacities != nullptr) {
         float opacity = opacities[gid];
         if (calc_compensations) {
