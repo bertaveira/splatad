@@ -2386,7 +2386,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         height = ctx.height
         tile_size = ctx.tile_size
 
-        v_means, v_quats, v_scales, v_colors, v_opacities = _make_lazy_cuda_func(
+        ray_grads = ctx.needs_input_grad[10]
+        v_means, v_quats, v_scales, v_colors, v_opacities, v_rays = _make_lazy_cuda_func(
             "rasterize_to_pixels_eval3d_bwd"
         )(
             means,
@@ -2414,12 +2415,24 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            ray_grads,
         )
 
         if ctx.needs_input_grad[5]:
             v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(dim=(1, 2))
         else:
             v_backgrounds = None
+
+        v_viewmats = None
+        if ray_grads:
+            # v_rays holds d/d(camera centre) and d/d(camera-to-world rotation).
+            with torch.enable_grad():
+                world_to_cam = viewmats.detach().requires_grad_(True)
+                cam_to_world = torch.linalg.inv(world_to_cam)
+                pulled = (cam_to_world[:, :3, 3] * v_rays[:, :3]).sum() + (
+                    cam_to_world[:, :3, :3] * v_rays[:, 3:].view(-1, 3, 3)
+                ).sum()
+                (v_viewmats,) = torch.autograd.grad(pulled, world_to_cam)
 
         return (
             v_means,
@@ -2432,7 +2445,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             None,  # width
             None,  # height
             None,  # tile_size
-            None,  # viewmats
+            v_viewmats,  # viewmats
             None,  # viewmats_rs
             None,  # Ks
             None,  # camera_model

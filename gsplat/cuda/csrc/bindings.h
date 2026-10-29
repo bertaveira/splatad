@@ -539,7 +539,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval
     const torch::Tensor &flatten_ids   // [n_isects]
 );
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_eval3d_bwd_tensor(
     const torch::Tensor &means,                     // [N, 3]
     const torch::Tensor &quats,                     // [N, 4]
@@ -565,5 +565,6 @@ rasterize_to_pixels_eval3d_bwd_tensor(
     const torch::Tensor &render_alphas,   // [C, image_height, image_width, 1]
     const torch::Tensor &last_ids,        // [C, image_height, image_width]
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, channels]
-    const torch::Tensor &v_render_alphas  // [C, image_height, image_width, 1]
+    const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
+    const bool ray_grads                  // also return v_rays [C, 12]
 );

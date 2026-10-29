@@ -711,7 +711,9 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
     glm::vec4 *__restrict__ v_quats,  // [N, 4]
     glm::vec3 *__restrict__ v_scales, // [N, 3]
     float *__restrict__ v_colors,     // [C, N, CDIM]
-    float *__restrict__ v_opacities   // [C, N]
+    float *__restrict__ v_opacities,  // [C, N]
+    // optional, global shutter: per tile, d/d(camera centre) and d/d(camera-to-world rotation)
+    float *__restrict__ v_ray_partials // [C, tile_height, tile_width, 12]
 ) {
     auto block = cg::this_thread_block();
     const uint32_t cid = block.group_index().x;
@@ -792,6 +794,10 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
     const uint32_t tr = block.thread_rank();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const int32_t warp_bin_final = cg::reduce(warp, bin_final, cg::greater<int>());
+    // this pixel's ray-origin and ray-direction gradients, summed over its Gaussians
+    const bool want_ray = v_ray_partials != nullptr;
+    glm::vec3 v_ray_o = {0.f, 0.f, 0.f};
+    glm::vec3 v_ray_d = {0.f, 0.f, 0.f};
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before writing next batch of shared mem
         block.sync();
@@ -924,6 +930,10 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                     const glm::vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
                     v_mean_local += -v_o_minus_mu;
+                    if (want_ray) {
+                        v_ray_o += v_o_minus_mu;
+                        v_ray_d += glm::transpose(Mt) * v_grd;
+                    }
                     if (filtered) {
                         // w = sqrt(b), b = scale^2 + spread2 t^2, c = sqrt(f(a) / f(b))
                         const glm::vec3 w = filter.widened_scale;
@@ -945,12 +955,20 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                                 (glm::vec3(a.y * a.z, a.x * a.z, a.x * a.y) / filter.f_a -
                                  glm::vec3(b.y * b.z, b.x * b.z, b.x * b.y) / filter.f_b);
                             quat_to_rotmat_vjp(quat, glm::outerProduct(ray_d, v_q), v_quat_local);
+                            if (want_ray) {
+                                v_ray_d += R * v_q; // q = R^T d
+                            }
                         }
                         v_a += v_b;
                         v_scale_local += 2.f * scale * v_a;
                         if (filter.t > 0.f) {
-                            v_mean_local +=
-                                (v_b.x + v_b.y + v_b.z) * 2.f * spread2 * filter.t * ray_d;
+                            // t = (mu - o) . d
+                            const float v_t = (v_b.x + v_b.y + v_b.z) * 2.f * spread2 * filter.t;
+                            v_mean_local += v_t * ray_d;
+                            if (want_ray) {
+                                v_ray_o -= v_t * ray_d;
+                                v_ray_d -= v_t * o_minus_mu;
+                            }
                         }
                     } else {
                         quat_scale_to_preci_half_vjp(
@@ -999,9 +1017,48 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
             }
         }
     }
+
+    if (want_ray) {
+        // d = R_wc d_cam and o is the camera centre, so per pixel dL/dR_wc = v_d d_cam^T.
+        float part[12] = {0.f};
+        if (active) {
+            const float *vm = viewmats0 + cid * 16;
+            const glm::vec3 d_cam = {
+                vm[0] * ray_d.x + vm[1] * ray_d.y + vm[2] * ray_d.z,
+                vm[4] * ray_d.x + vm[5] * ray_d.y + vm[6] * ray_d.z,
+                vm[8] * ray_d.x + vm[9] * ray_d.y + vm[10] * ray_d.z
+            };
+            part[0] = v_ray_o.x;
+            part[1] = v_ray_o.y;
+            part[2] = v_ray_o.z;
+#pragma unroll
+            for (uint32_t r = 0; r < 3; ++r) {
+#pragma unroll
+                for (uint32_t c = 0; c < 3; ++c) {
+                    part[3 + 3 * r + c] = v_ray_d[r] * d_cam[c];
+                }
+            }
+        }
+        __shared__ float warp_parts[32][12];
+#pragma unroll
+        for (uint32_t k = 0; k < 12; ++k) {
+            const float total = cg::reduce(warp, part[k], cg::plus<float>());
+            if (warp.thread_rank() == 0) {
+                warp_parts[tr / 32][k] = total;
+            }
+        }
+        block.sync();
+        if (tr < 12) {
+            float total = 0.f;
+            for (uint32_t w = 0; w < (block_size + 31) / 32; ++w) {
+                total += warp_parts[w][tr];
+            }
+            v_ray_partials[(cid * tile_height * tile_width + tile_id) * 12 + tr] = total;
+        }
+    }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_eval3d_bwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means,                     // [N, 3]
@@ -1033,7 +1090,8 @@ rasterize_to_pixels_eval3d_bwd_tensor(
     const torch::Tensor &last_ids,      // [C, image_height, image_width]
     // gradients of outputs
     const torch::Tensor &v_render_colors, // [C, image_height, image_width, channels]
-    const torch::Tensor &v_render_alphas  // [C, image_height, image_width, 1]
+    const torch::Tensor &v_render_alphas, // [C, image_height, image_width, 1]
+    const bool ray_grads                  // also return v_rays
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -1084,9 +1142,17 @@ rasterize_to_pixels_eval3d_bwd_tensor(
     torch::Tensor v_scales = torch::zeros_like(scales);
     torch::Tensor v_colors = torch::zeros_like(colors);
     torch::Tensor v_opacities = torch::zeros_like(opacities);
+    // [C, 12]: d/d(camera centre), then d/d(camera-to-world rotation) row-major
+    torch::Tensor v_rays = torch::zeros({C, 12}, means.options());
+    TORCH_CHECK(
+        !ray_grads || rs_type == ShutterType::GLOBAL,
+        "eval3d camera pose gradients need a global shutter"
+    );
+    torch::Tensor v_ray_partials =
+        ray_grads ? torch::zeros({C, tile_height, tile_width, 12}, means.options()) : torch::Tensor();
 
     if (n_isects == 0) {
-        return std::make_tuple(v_means, v_quats, v_scales, v_colors, v_opacities);
+        return std::make_tuple(v_means, v_quats, v_scales, v_colors, v_opacities, v_rays);
     }
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
@@ -1151,7 +1217,8 @@ rasterize_to_pixels_eval3d_bwd_tensor(
             reinterpret_cast<glm::vec4 *>(v_quats.data_ptr<float>()),                          \
             reinterpret_cast<glm::vec3 *>(v_scales.data_ptr<float>()),                         \
             v_colors.data_ptr<float>(),                                                        \
-            v_opacities.data_ptr<float>()                                                      \
+            v_opacities.data_ptr<float>(),                                                     \
+            ray_grads ? v_ray_partials.data_ptr<float>() : nullptr                             \
         );                                                                                     \
         break;
 
@@ -1179,5 +1246,8 @@ rasterize_to_pixels_eval3d_bwd_tensor(
         AT_ERROR("Unsupported number of channels: ", channels);
     }
 #undef LAUNCH_EVAL3D_BWD
-    return std::make_tuple(v_means, v_quats, v_scales, v_colors, v_opacities);
+    if (ray_grads) {
+        v_rays = v_ray_partials.view({C, -1, 12}).sum(1);
+    }
+    return std::make_tuple(v_means, v_quats, v_scales, v_colors, v_opacities, v_rays);
 }
