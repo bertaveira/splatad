@@ -534,6 +534,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval
     const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
     const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
     const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,                       // ray-footprint filter, px^2; 0 disables
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids   // [n_isects]
 );
@@ -558,6 +559,7 @@ rasterize_to_pixels_eval3d_bwd_tensor(
     const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
     const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
     const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,                       // ray-footprint filter, px^2; 0 disables
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids,  // [n_isects]
     const torch::Tensor &render_alphas,   // [C, image_height, image_width, 1]

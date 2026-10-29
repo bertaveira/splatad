@@ -1181,6 +1181,7 @@ def rasterize_to_pixels_eval3d(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [C, 4, 4]
+    footprint_variance: float = 0.0,
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels by evaluating them in 3D along per-pixel rays.
 
@@ -1190,6 +1191,10 @@ def rasterize_to_pixels_eval3d(
     approach. Tile binning comes from :func:`fully_fused_projection_with_ut`.
     Differentiable w.r.t. ``means``, ``quats``, ``scales``, ``colors``, ``opacities``
     and ``backgrounds``; not w.r.t. the camera.
+
+    ``footprint_variance > 0`` (px^2) widens each Gaussian to the pixel footprint
+    at its distance, the 3D counterpart of ``eps2d``, so sub-pixel Gaussians do
+    not shimmer as the camera moves.
 
     Returns:
         A tuple ``(colors [C, H, W, channels], alphas [C, H, W, 1])``.
@@ -1265,6 +1270,7 @@ def rasterize_to_pixels_eval3d(
         None if radial_coeffs is None else radial_coeffs.contiguous(),
         None if tangential_coeffs is None else tangential_coeffs.contiguous(),
         None if thin_prism_coeffs is None else thin_prism_coeffs.contiguous(),
+        float(footprint_variance),
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
     )
@@ -2294,6 +2300,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         radial_coeffs: Optional[Tensor],
         tangential_coeffs: Optional[Tensor],
         thin_prism_coeffs: Optional[Tensor],
+        footprint_variance: float,
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
     ) -> Tuple[Tensor, Tensor]:
@@ -2318,6 +2325,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
+            footprint_variance,
             isect_offsets,
             flatten_ids,
         )
@@ -2346,6 +2354,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.camera_model = camera_model
         ctx.rolling_shutter = rolling_shutter
+        ctx.footprint_variance = footprint_variance
         return render_colors, render_alphas
 
     @staticmethod
@@ -2398,6 +2407,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
+            ctx.footprint_variance,
             isect_offsets,
             flatten_ids,
             render_alphas,
@@ -2430,6 +2440,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             None,  # radial_coeffs
             None,  # tangential_coeffs
             None,  # thin_prism_coeffs
+            None,  # footprint_variance
             None,  # isect_offsets
             None,  # flatten_ids
         )

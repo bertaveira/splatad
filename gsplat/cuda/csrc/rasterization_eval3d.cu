@@ -75,6 +75,111 @@ inline __device__ glm::mat3 eval3d_inverse_scale_rotation(
     return S * glm::transpose(R);
 }
 
+// Footprint filter, the 3D counterpart of eps2d: widens each Gaussian by
+// footprint_variance * (pixel angle * t)^2 per axis and scales its response by
+// the determinant ratio of its covariance projected perpendicular to the ray.
+
+constexpr float FOOTPRINT_OFFSET_PX = 5.f;
+
+// Angle a pixel subtends, measured between rays on both image diagonals; falls
+// back to 1 / focal length where a ray is invalid.
+inline __device__ float eval3d_pixel_footprint(
+    const float px,
+    const float py,
+    const uint32_t cid,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float *__restrict__ Ks,
+    const CameraModelType camera_model_type,
+    const ShutterType rs_type,
+    const float *__restrict__ radial_coeffs,
+    const float *__restrict__ tangential_coeffs,
+    const float *__restrict__ thin_prism_coeffs
+) {
+    const float h = FOOTPRINT_OFFSET_PX;
+    float footprint = rsqrtf(Ks[cid * 9 + 0] * Ks[cid * 9 + 4]);
+    with_camera_model(
+        camera_model_type,
+        cid,
+        Ks,
+        image_width,
+        image_height,
+        rs_type,
+        radial_coeffs,
+        tangential_coeffs,
+        thin_prism_coeffs,
+        [&](auto const &camera_model) {
+            const float x_max = (float)image_width - 0.5f, y_max = (float)image_height - 0.5f;
+            auto inside = [&](float x, float y) {
+                return glm::vec2(fminf(fmaxf(x, 0.5f), x_max), fminf(fmaxf(y, 0.5f), y_max));
+            };
+            const glm::vec2 pa0 = inside(px + h, py + h);
+            const glm::vec2 pa1 = inside(px - h, py - h);
+            const glm::vec2 pb0 = inside(px + h, py - h);
+            const glm::vec2 pb1 = inside(px - h, py + h);
+            const CameraRay a0 = camera_model.image_point_to_camera_ray(pa0);
+            const CameraRay a1 = camera_model.image_point_to_camera_ray(pa1);
+            const CameraRay b0 = camera_model.image_point_to_camera_ray(pb0);
+            const CameraRay b1 = camera_model.image_point_to_camera_ray(pb1);
+            const float da = glm::length(pa0 - pa1);
+            const float db = glm::length(pb0 - pb1);
+            if (a0.valid_flag && a1.valid_flag && b0.valid_flag && b1.valid_flag && da > 0.f &&
+                db > 0.f) {
+                const float angle_a = atan2f(
+                    glm::length(glm::cross(a0.ray_dir, a1.ray_dir)), glm::dot(a0.ray_dir, a1.ray_dir)
+                );
+                const float angle_b = atan2f(
+                    glm::length(glm::cross(b0.ray_dir, b1.ray_dir)), glm::dot(b0.ray_dir, b1.ray_dir)
+                );
+                footprint = 0.5f * (angle_a / da + angle_b / db);
+            }
+        }
+    );
+    return footprint;
+}
+
+// q^T adj(diag(a)) q and its gradient w.r.t. a.
+inline __device__ float eval3d_adjugate_form(const glm::vec3 &q, const glm::vec3 &a) {
+    return q.x * q.x * a.y * a.z + q.y * q.y * a.x * a.z + q.z * q.z * a.x * a.y;
+}
+
+inline __device__ glm::vec3 eval3d_adjugate_form_grad(const glm::vec3 &q, const glm::vec3 &a) {
+    return {
+        q.y * q.y * a.z + q.z * q.z * a.y,
+        q.x * q.x * a.z + q.z * q.z * a.x,
+        q.x * q.x * a.y + q.y * q.y * a.x,
+    };
+}
+
+struct FootprintFilter {
+    glm::vec3 widened_scale; // sqrt(scale^2 + added variance)
+    float compensation;      // response multiplier, in [0, 1]
+    float t;                 // distance along the ray to the centre (>= 0)
+    glm::vec3 q;             // R^T ray_d
+    float f_a, f_b;          // adjugate forms of scale^2 and widened_scale^2
+};
+
+inline __device__ FootprintFilter eval3d_footprint_filter(
+    const glm::mat3 &R,
+    const glm::vec3 &scale,
+    const glm::vec3 &mean,
+    const glm::vec3 &ray_o,
+    const glm::vec3 &ray_d,
+    const float spread2
+) {
+    FootprintFilter f;
+    f.t = fmaxf(glm::dot(mean - ray_o, ray_d), 0.f);
+    const float added = spread2 * f.t * f.t;
+    const glm::vec3 a = scale * scale;
+    const glm::vec3 b = a + added;
+    f.widened_scale = {sqrtf(b.x), sqrtf(b.y), sqrtf(b.z)};
+    f.q = glm::transpose(R) * ray_d;
+    f.f_a = eval3d_adjugate_form(f.q, a);
+    f.f_b = eval3d_adjugate_form(f.q, b);
+    f.compensation = sqrtf(fminf(f.f_a / fmaxf(f.f_b, 1e-30f), 1.f));
+    return f;
+}
+
 } // namespace
 
 /****************************************************************************
@@ -107,6 +212,7 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
     const float *__restrict__ radial_coeffs,     // [C, 6] or [C, 4] optional
     const float *__restrict__ tangential_coeffs, // [C, 2] optional
     const float *__restrict__ thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,              // ray-footprint filter, px^2; 0 disables
     // intersections
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
@@ -144,6 +250,15 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
     );
     const glm::vec3 ray_d = ray.ray_dir;
     const glm::vec3 ray_o = ray.ray_org;
+    const bool filtered = footprint_variance > 0.f;
+    float spread2 = 0.f;
+    if (filtered) {
+        const float footprint = eval3d_pixel_footprint(
+            px, py, cid, image_width, image_height, Ks, camera_model_type, rs_type,
+            radial_coeffs, tangential_coeffs, thin_prism_coeffs
+        );
+        spread2 = footprint_variance * footprint * footprint;
+    }
 
     // return if out of bounds
     // keep not rasterizing threads around for reading data
@@ -176,8 +291,10 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
     extern __shared__ int s[];
     int32_t *id_batch = reinterpret_cast<int32_t *>(s);                            // [block_size]
     glm::vec4 *xyz_opacity_batch = reinterpret_cast<glm::vec4 *>(&id_batch[block_size]); // [block_size]
+    // S^-1 R^T, or R when filtered
     glm::mat3 *iscl_rot_batch =
         reinterpret_cast<glm::mat3 *>(&xyz_opacity_batch[block_size]); // [block_size]
+    glm::vec3 *scale_batch = reinterpret_cast<glm::vec3 *>(&iscl_rot_batch[block_size]); // [block_size]
 
     // current visibility left to render
     float T = 1.0f;
@@ -209,7 +326,12 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
             xyz_opacity_batch[tr] = {xyz.x, xyz.y, xyz.z, opac};
             const glm::vec4 quat = quats[isect_gid];
             const glm::vec3 scale = scales[isect_gid];
-            iscl_rot_batch[tr] = eval3d_inverse_scale_rotation(quat_to_rotmat(quat), scale);
+            if (filtered) {
+                iscl_rot_batch[tr] = quat_to_rotmat(quat);
+                scale_batch[tr] = scale;
+            } else {
+                iscl_rot_batch[tr] = eval3d_inverse_scale_rotation(quat_to_rotmat(quat), scale);
+            }
         }
 
         // wait for other threads to collect the gaussians in batch
@@ -221,7 +343,15 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
             const glm::vec4 xyz_opac = xyz_opacity_batch[t];
             const float opac = xyz_opac[3];
             const glm::vec3 xyz = {xyz_opac[0], xyz_opac[1], xyz_opac[2]};
-            const glm::mat3 iscl_rot = iscl_rot_batch[t];
+            glm::mat3 iscl_rot = iscl_rot_batch[t];
+            float compensation = 1.f;
+            if (filtered) {
+                const FootprintFilter f = eval3d_footprint_filter(
+                    iscl_rot, scale_batch[t], xyz, ray_o, ray_d, spread2
+                );
+                iscl_rot = eval3d_inverse_scale_rotation(iscl_rot, f.widened_scale);
+                compensation = f.compensation;
+            }
 
             const glm::vec3 gro = iscl_rot * (ray_o - xyz);
             const glm::vec3 grd = safe_normalize(iscl_rot * ray_d);
@@ -235,7 +365,7 @@ __global__ void rasterize_to_pixels_eval3d_fwd_kernel(
             const float gray_dist = glm::dot(gcrod, gcrod);
             const float power = -0.5f * gray_dist;
 
-            const float alpha = min(0.999f, opac * __expf(power));
+            const float alpha = min(0.999f, opac * compensation * __expf(power));
             if (alpha < ALPHA_THRESHOLD) {
                 continue;
             }
@@ -294,6 +424,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval
     const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
     const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
     const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,                       // ray-footprint filter, px^2; 0 disables
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids   // [n_isects]
@@ -352,7 +483,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval
 
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
-        tile_size * tile_size * (sizeof(int32_t) + sizeof(glm::vec4) + sizeof(glm::mat3));
+        tile_size * tile_size *
+        (sizeof(int32_t) + sizeof(glm::vec4) + sizeof(glm::mat3) + sizeof(glm::vec3));
 
 #define LAUNCH_EVAL3D_FWD(CDIM)                                                            \
     case CDIM:                                                                                 \
@@ -393,6 +525,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rasterize_to_pixels_eval
                                           : nullptr,                                           \
             thin_prism_coeffs.has_value() ? thin_prism_coeffs.value().data_ptr<float>()        \
                                           : nullptr,                                           \
+            footprint_variance,                                                                \
             tile_offsets.data_ptr<int32_t>(),                                                  \
             flatten_ids.data_ptr<int32_t>(),                                                   \
             renders.data_ptr<float>(),                                                         \
@@ -459,6 +592,7 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
     const float *__restrict__ radial_coeffs,     // [C, 6] or [C, 4] optional
     const float *__restrict__ tangential_coeffs, // [C, 2] optional
     const float *__restrict__ thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,              // ray-footprint filter, px^2; 0 disables
     // intersections
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
@@ -509,6 +643,15 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
     );
     const glm::vec3 ray_d = ray.ray_dir;
     const glm::vec3 ray_o = ray.ray_org;
+    const bool filtered = footprint_variance > 0.f;
+    float spread2 = 0.f;
+    if (filtered) {
+        const float footprint = eval3d_pixel_footprint(
+            px, py, cid, image_width, image_height, Ks, camera_model_type, rs_type,
+            radial_coeffs, tangential_coeffs, thin_prism_coeffs
+        );
+        spread2 = footprint_variance * footprint * footprint;
+    }
 
     // keep not rasterizing threads around for reading data
     const bool active = (i < image_height && j < image_width) && ray.valid_flag;
@@ -595,6 +738,8 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
             glm::vec4 quat;
             glm::mat3 Mt;
             glm::vec3 o_minus_mu, gro, grd, grd_n, gcrod;
+            FootprintFilter filter;
+            float compensation = 1.f;
             if (valid) {
                 const glm::vec4 xyz_opac = xyz_opacity_batch[t];
                 opac = xyz_opac[3];
@@ -603,7 +748,13 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                 quat = quat_batch[t];
 
                 R = quat_to_rotmat(quat);
-                Mt = eval3d_inverse_scale_rotation(R, scale);
+                if (filtered) {
+                    filter = eval3d_footprint_filter(R, scale, xyz, ray_o, ray_d, spread2);
+                    compensation = filter.compensation;
+                    Mt = eval3d_inverse_scale_rotation(R, filter.widened_scale);
+                } else {
+                    Mt = eval3d_inverse_scale_rotation(R, scale);
+                }
                 o_minus_mu = ray_o - xyz;
                 gro = Mt * o_minus_mu;
                 grd = Mt * ray_d;
@@ -617,7 +768,7 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                     const float gray_dist = glm::dot(gcrod, gcrod);
                     const float power = -0.5f * gray_dist;
                     vis = __expf(power);
-                    alpha = min(0.999f, opac * vis);
+                    alpha = min(0.999f, opac * compensation * vis);
                     if (alpha < ALPHA_THRESHOLD) {
                         valid = false;
                     }
@@ -662,8 +813,8 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
-                if (opac * vis <= 0.999f) {
-                    const float v_vis = opac * v_alpha;
+                if (opac * compensation * vis <= 0.999f) {
+                    const float v_vis = opac * compensation * v_alpha;
                     const float v_grad_dist = -0.5f * vis * v_vis;
                     const glm::vec3 v_gcrod = 2.0f * v_grad_dist * gcrod;
                     const glm::vec3 v_grd_n = -glm::cross(v_gcrod, gro);
@@ -674,10 +825,40 @@ __global__ void rasterize_to_pixels_eval3d_bwd_kernel(
                     const glm::vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
                     v_mean_local += -v_o_minus_mu;
-                    quat_scale_to_preci_half_vjp(
-                        quat, scale, R, glm::transpose(v_Mt), v_quat_local, v_scale_local
-                    );
-                    v_opacity_local = vis * v_alpha;
+                    if (filtered) {
+                        // w = sqrt(b), b = scale^2 + spread2 t^2, c = sqrt(f(a) / f(b))
+                        const glm::vec3 w = filter.widened_scale;
+                        glm::vec3 v_w = {0.f, 0.f, 0.f};
+                        quat_scale_to_preci_half_vjp(
+                            quat, w, R, glm::transpose(v_Mt), v_quat_local, v_w
+                        );
+                        glm::vec3 v_b = v_w / (2.f * w);
+                        glm::vec3 v_a = {0.f, 0.f, 0.f};
+                        if (compensation < 1.f && filter.f_a > 1e-30f) {
+                            const glm::vec3 a = scale * scale;
+                            const glm::vec3 b = w * w;
+                            const float v_log_c = opac * vis * v_alpha * compensation;
+                            v_a += 0.5f * v_log_c * eval3d_adjugate_form_grad(filter.q, a) / filter.f_a;
+                            v_b -= 0.5f * v_log_c * eval3d_adjugate_form_grad(filter.q, b) / filter.f_b;
+                            const glm::vec3 q = filter.q;
+                            const glm::vec3 v_q =
+                                v_log_c * q *
+                                (glm::vec3(a.y * a.z, a.x * a.z, a.x * a.y) / filter.f_a -
+                                 glm::vec3(b.y * b.z, b.x * b.z, b.x * b.y) / filter.f_b);
+                            quat_to_rotmat_vjp(quat, glm::outerProduct(ray_d, v_q), v_quat_local);
+                        }
+                        v_a += v_b;
+                        v_scale_local += 2.f * scale * v_a;
+                        if (filter.t > 0.f) {
+                            v_mean_local +=
+                                (v_b.x + v_b.y + v_b.z) * 2.f * spread2 * filter.t * ray_d;
+                        }
+                    } else {
+                        quat_scale_to_preci_half_vjp(
+                            quat, scale, R, glm::transpose(v_Mt), v_quat_local, v_scale_local
+                        );
+                    }
+                    v_opacity_local = compensation * vis * v_alpha;
                 }
 
 #pragma unroll
@@ -744,6 +925,7 @@ rasterize_to_pixels_eval3d_bwd_tensor(
     const at::optional<torch::Tensor> &radial_coeffs,     // [C, 6] or [C, 4] optional
     const at::optional<torch::Tensor> &tangential_coeffs, // [C, 2] optional
     const at::optional<torch::Tensor> &thin_prism_coeffs, // [C, 4] optional
+    const float footprint_variance,                       // ray-footprint filter, px^2; 0 disables
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids,  // [n_isects]
@@ -853,6 +1035,7 @@ rasterize_to_pixels_eval3d_bwd_tensor(
                                           : nullptr,                                           \
             thin_prism_coeffs.has_value() ? thin_prism_coeffs.value().data_ptr<float>()        \
                                           : nullptr,                                           \
+            footprint_variance,                                                                \
             tile_offsets.data_ptr<int32_t>(),                                                  \
             flatten_ids.data_ptr<int32_t>(),                                                   \
             render_alphas.data_ptr<float>(),                                                   \

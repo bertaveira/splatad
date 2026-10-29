@@ -74,6 +74,7 @@ def rasterization(
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [C, 4, 4] pose at the end of the exposure
     ut_params: Optional[UnscentedTransformParameters] = None,
+    footprint_variance: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -86,7 +87,8 @@ def rasterization(
         requires ``packed=False``, ``sparse_grad=False``, ``rasterize_mode="classic"``
         and replaces SplatAD's velocity rolling shutter (``linear_velocity``,
         ``angular_velocity``, ``rolling_shutter_time``, ``velocities``) with the
-        pose-interpolated ``rolling_shutter`` / ``viewmats_rs``.
+        pose-interpolated ``rolling_shutter`` / ``viewmats_rs``. ``footprint_variance``
+        (px^2) is eval3d's counterpart of ``eps2d``.
 
     This function provides a handful features for 3D Gaussian rasterization, which
     we detail in the following notes. A complete profiling of the these features
@@ -275,6 +277,7 @@ def rasterization(
         )
     if with_eval3d:
         assert with_ut, "with_eval3d requires with_ut=True (its tile binning comes from the UT projection)"
+    assert footprint_variance == 0.0 or with_eval3d, "footprint_variance filters the eval3d rasterizer only"
     if rolling_shutter != RollingShutterType.GLOBAL:
         assert viewmats_rs is not None, "rolling_shutter requires viewmats_rs"
     if with_ut:
@@ -333,7 +336,7 @@ def rasterization(
             Ks,
             width,
             height,
-            eps2d=eps2d,
+            eps2d=max(eps2d, footprint_variance),  # bounds must cover the footprint filter
             near_plane=near_plane,
             far_plane=far_plane,
             radius_clip=radius_clip,
@@ -493,6 +496,7 @@ def rasterization(
                 radial_coeffs=radial_coeffs,
                 rolling_shutter=rolling_shutter,
                 viewmats_rs=viewmats_rs,
+                footprint_variance=footprint_variance,
             )
             return render_colors_, render_alphas_, None
         return rasterize_to_pixels(
